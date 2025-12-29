@@ -1,91 +1,120 @@
-import hid
 import time
+import hid
+from .exceptions import ZkUhfError
 
 VID = 0x0416
 PID = 0xB00B
-INTERFACE = 0
+INTERFACE_NUMBER = 0
 REPORT_LEN = 64
 
-def pad(cmd):
+def _pad(cmd: bytes) -> bytes:
     return cmd + bytes(REPORT_LEN - len(cmd))
 
-CMD_CONNECT  = pad(bytes.fromhex("AA FF DC 01 00 01 BF 84 55"))
-CMD_WORKMODE = pad(bytes.fromhex("AA FF EF 00 00 01 E1 55"))
-CMD_ANTENNA  = pad(bytes.fromhex("AA FF ED 00 00 A0 21 55"))
-CMD_POWER    = pad(bytes.fromhex("AA FF EB 00 00 40 20 55"))
-CMD_READ     = pad(bytes.fromhex("AA FF F6 00 00 D0 26 55"))
+# === Commands (verified from capture) ===
+CMD_CONNECT  = _pad(bytes.fromhex("AA FF DC 01 00 01 BF 84 55"))
+CMD_WORKMODE = _pad(bytes.fromhex("AA FF EF 00 00 01 E1 55"))
+CMD_ANTENNA  = _pad(bytes.fromhex("AA FF ED 00 00 A0 21 55"))
+CMD_POWER    = _pad(bytes.fromhex("AA FF EB 00 00 40 20 55"))
+CMD_READ     = _pad(bytes.fromhex("AA FF F6 00 00 D0 26 55"))
 
-def decode_card_number(data: bytes) -> str | None:
-    # Must be EPC inventory frame
-    if len(data) < 8 or data[0] != 0xAA or data[2] != 0xC8:
+
+class ZkUhfReader:
+    """
+    ZKTeco / Winbond UHF reader (Linux, HID)
+
+    Usage:
+        r = ZkUhfReader()
+        r.connect()
+        card = r.read_once()
+        r.close()
+    """
+
+    def __init__(self):
+        self._dev: hid.Device | None = None
+
+    # ----------------------------
+    # Low-level helpers
+    # ----------------------------
+
+    def _send(self, cmd: bytes, delay: float = 0.05):
+        # HID interrupt OUT with report ID 0x00
+        self._dev.write(b"\x00" + cmd)
+        time.sleep(delay)
+
+    # ----------------------------
+    # Public API
+    # ----------------------------
+
+    def connect(self):
+        """Open device and run CONNECT sequence (mandatory)."""
+        for d in hid.enumerate(VID, PID):
+            if d.get("interface_number") == INTERFACE_NUMBER:
+                self._dev = hid.Device(path=d["path"])
+                self._dev.nonblocking = True
+                break
+        else:
+            raise ZkUhfError("UHF reader not found")
+
+        # CONNECT sequence (exact demo behavior)
+        self._send(CMD_CONNECT)
+        self._send(CMD_WORKMODE)
+        self._send(CMD_ANTENNA)
+        self._send(CMD_POWER)
+
+    def close(self):
+        if self._dev:
+            self._dev.close()
+            self._dev = None
+
+    def read_once(self, timeout: float = 1.5) -> str | None:
+        """
+        Perform a single inventory round.
+        Returns 8-digit card number or None.
+        """
+        if not self._dev:
+            raise ZkUhfError("Reader not connected")
+
+        self._send(CMD_READ, delay=0.01)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = self._dev.read(REPORT_LEN)
+            if data:
+                card = self._decode_card_number(bytes(data))
+                if card:
+                    return card
+            time.sleep(0.01)
+
         return None
 
-    epc_len = data[3]
-    epc_start = 4
-    epc_end = epc_start + epc_len
+    # ----------------------------
+    # EPC decoding (final, correct)
+    # ----------------------------
 
-    if len(data) < epc_end:
+    @staticmethod
+    def _decode_card_number(data: bytes) -> str | None:
+        """
+        Decode card number from EPC frame.
+        Rule:
+        - Use EPC payload length
+        - Extract 3-byte values
+        - Select value that appears twice
+        """
+        if len(data) < 8 or data[0] != 0xAA or data[2] != 0xC8:
+            return None
+
+        epc_len = data[3]
+        epc = data[4:4 + epc_len]
+
+        candidates = []
+        for i in range(len(epc) - 2):
+            v = int.from_bytes(epc[i:i+3], "big")
+            if 1 <= v <= 50_000_000:
+                candidates.append(v)
+
+        for v in set(candidates):
+            if candidates.count(v) >= 2:
+                return f"{v:08d}"
+
         return None
-
-    epc = data[epc_start:epc_end]
-
-    candidates = []
-
-    # slide 3-byte window across EPC payload
-    for i in range(len(epc) - 2):
-        val = int.from_bytes(epc[i:i+3], "big")
-        if 1 <= val <= 50_000_000:
-            candidates.append(val)
-
-    if not candidates:
-        return None
-
-    # choose the value that repeats
-    for v in set(candidates):
-        if candidates.count(v) >= 2:
-            return f"{v:08d}"
-
-    return None
-
-def main():
-    for d in hid.enumerate(VID, PID):
-        if d.get("interface_number") == INTERFACE:
-            dev = hid.Device(path=d["path"])
-            dev.nonblocking = True
-            break
-    else:
-        raise RuntimeError("Reader not found")
-
-    def send(cmd):
-        dev.write(b"\x00" + cmd)
-        time.sleep(0.05)
-
-    # CONNECT sequence (once)
-    send(CMD_CONNECT)
-    send(CMD_WORKMODE)
-    send(CMD_ANTENNA)
-    send(CMD_POWER)
-
-    print("Connected. Press Enter to READ (Ctrl+C to exit).")
-
-    try:
-        while True:
-            input()
-            send(CMD_READ)
-
-            end = time.time() + 1.5
-            while time.time() < end:
-                data = dev.read(REPORT_LEN)
-                if data and data[2] == 0xC8:
-                    card = decode_card_number(bytes(data))
-                    if card:
-                        print("CARD:", card)
-                    else:
-                        print("EPC:", bytes(data).hex())
-                time.sleep(0.01)
-    finally:
-        dev.close()
-
-if __name__ == "__main__":
-    main()
 
