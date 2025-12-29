@@ -1,0 +1,2 @@
+sudo apt install libhidapi-hidraw0 libhidapi-dev python3-hid
+
