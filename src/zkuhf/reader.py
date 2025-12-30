@@ -16,7 +16,8 @@ CMD_WORKMODE = _pad(bytes.fromhex("AA FF EF 00 00 01 E1 55"))
 CMD_ANTENNA  = _pad(bytes.fromhex("AA FF ED 00 00 A0 21 55"))
 CMD_POWER    = _pad(bytes.fromhex("AA FF EB 00 00 40 20 55"))
 CMD_READ     = _pad(bytes.fromhex("AA FF F6 00 00 D0 26 55"))
-
+CMD_BUZZER_OFF = _pad(bytes.fromhex("AA FF E9 00 00 00 E9 55"))
+CMD_BUZZER_ON  = _pad(bytes.fromhex("AA FF E9 01 00 01 EA 55"))
 
 class ZkUhfReader:
     """
@@ -67,13 +68,13 @@ class ZkUhfReader:
             self._dev = None
 
     def read_once(self, timeout: float = 1.5) -> str | None:
-        """
-        Perform a single inventory round.
-        Returns 8-digit card number or None.
-        """
         if not self._dev:
             raise ZkUhfError("Reader not connected")
 
+        # Disable buzzer before inventory (demo behavior)
+        self._send(CMD_BUZZER_OFF, delay=0.01)
+
+        # Start single inventory round
         self._send(CMD_READ, delay=0.01)
 
         deadline = time.time() + timeout
@@ -82,9 +83,12 @@ class ZkUhfReader:
             if data:
                 card = self._decode_card_number(bytes(data))
                 if card:
+                    # Enable buzzer ONLY when EPC is found
+                    self._send(CMD_BUZZER_ON, delay=0.01)
                     return card
             time.sleep(0.01)
 
+        # No card found → keep buzzer silent
         return None
 
     # ----------------------------
